@@ -1,355 +1,328 @@
 #include <bits/stdc++.h>
 using namespace std;
 
-// ─────────────────────────────────────────────
-//  Global graph data (read-only after init)
-// ─────────────────────────────────────────────
-static int N;                          // number of nodes
+// ═══════════════════════════════════════════════════════════════
+//  GLOBAL GRAPH DATA
+// ═══════════════════════════════════════════════════════════════
+static int N, M;
+static constexpr int INF = 1e9;
+static vector<vector<int>> adj;
 
-// For each node: bitmask of itself + all neighbours ("coverage mask")
-// We use dynamic bitsets via vector<uint64_t> words.
-// covered_by[v] = set of nodes that get powered if v has a plant
-static vector<vector<uint64_t>> covered_by;   // [node][word]
-static int WORDS;                              // ceil(N/64)
+// covered_by[v] = bitmask of {v} ∪ neighbours(v)
+static vector<vector<uint64_t>> covered_by;
+static int WORDS;
 
-// ─────────────────────────────────────────────
-//  Shared best solution (protected by mutex)
-// ─────────────────────────────────────────────
-static atomic<int>       best_count;
-static mutex             best_mutex;
-static vector<int>       best_state_global;   // 1 = plant, 0 = no plant
+// ═══════════════════════════════════════════════════════════════
+//  BITSET HELPERS
+// ═══════════════════════════════════════════════════════════════
+static inline int  first_set (const vector<uint64_t>& w) {
+    for(int i=0;i<WORDS;i++) if(w[i]) return i*64+__builtin_ctzll(w[i]); return -1;
+}
+static inline bool bit_test  (const vector<uint64_t>& w,int v){return(w[v>>6]>>(v&63))&1;}
+static inline void bit_set   (vector<uint64_t>& w,int v){w[v>>6]|= (1ULL<<(v&63));}
+static inline void bit_clear (vector<uint64_t>& w,int v){w[v>>6]&=~(1ULL<<(v&63));}
 
-// ─────────────────────────────────────────────
-//  Inline bitset helpers
-// ─────────────────────────────────────────────
-// Returns index of lowest set bit across words[], or -1 if all zero.
-static inline int first_set(const vector<uint64_t>& words)
-{
-    for (int w = 0; w < WORDS; w++)
-        if (words[w]) return w * 64 + __builtin_ctzll(words[w]);
-    return -1;
+// ═══════════════════════════════════════════════════════════════
+//  GRAPH TYPE DETECTION
+// ═══════════════════════════════════════════════════════════════
+static bool is_forest() {
+    if(M>=N) return false;
+    vector<int> col(N,0);
+    for(int s=0;s<N;s++){
+        if(col[s]) continue;
+        stack<pair<int,int>> st; st.push({s,-1});
+        while(!st.empty()){
+            auto[u,p]=st.top(); st.pop();
+            if(col[u]==2) continue;
+            if(col[u]==1){col[u]=2;continue;}
+            col[u]=1; st.push({u,p});
+            for(int v:adj[u]){
+                if(v==p) continue;
+                if(col[v]==1) return false;
+                if(!col[v]) st.push({v,u});
+            }
+        }
+    }
+    return true;
 }
 
-// popcount across all words
-static inline int popcount_all(const vector<uint64_t>& words)
-{
-    int c = 0;
-    for (int w = 0; w < WORDS; w++) c += __builtin_popcountll(words[w]);
-    return c;
-}
+// ═══════════════════════════════════════════════════════════════
+//  SOLVER 1 — TREE DP  (exact O(n))
+//
+//  State for node u in a rooted tree:
+//    0 = u HAS a plant
+//    1 = u has NO plant, IS covered by a child
+//    2 = u has NO plant, NOT covered yet  (parent will cover it)
+//
+//  Leaf base: dp = {1, INF, 0}
+//
+//  Merge child v into u:
+//    dp'[0] = dp[u][0] + min(dp[v][0], dp[v][1], dp[v][2])
+//    dp'[1] = min( dp[u][1] + min(dp[v][0],dp[v][1]),   // u already covered
+//                  dp[u][2] + dp[v][0] )                  // v's plant now covers u
+//    dp'[2] = dp[u][2] + min(dp[v][0], dp[v][1])         // v must cover itself
+//
+//  Root: state 2 invalid → pick min(dp[r][0], dp[r][1])
+// ═══════════════════════════════════════════════════════════════
+static vector<int> solve_tree() {
+    vector<int> result(N,0);
+    vector<int> par(N,-1);
+    vector<bool> vis(N,false);
+    vector<array<int,3>> dp(N);
+    vector<vector<int>> ch(N);
 
-// ─────────────────────────────────────────────
-//  Greedy warm-start
-//  Repeatedly pick the node whose coverage mask
-//  covers the most still-uncovered nodes.
-// ─────────────────────────────────────────────
-static int greedy_solution(vector<int>& out_state)
-{
-    // uncovered = bitmask of nodes not yet powered
-    vector<uint64_t> uncovered(WORDS, ~0ULL);
-    // mask off bits beyond N
-    if (N % 64) uncovered[WORDS-1] = (1ULL << (N % 64)) - 1;
+    for(int root=0;root<N;root++){
+        if(vis[root]) continue;
 
-    out_state.assign(N, 0);
-    int count = 0;
+        vector<int> order;
+        {
+            stack<int> st; st.push(root); par[root]=-1;
+            while(!st.empty()){
+                int u=st.top(); st.pop();
+                if(vis[u]) continue;
+                vis[u]=true; order.push_back(u);
+                for(int v:adj[u]) if(!vis[v]){par[v]=u;st.push(v);}
+            }
+        }
+        reverse(order.begin(),order.end()); // leaves first
 
-    while (true) {
-        // find uncovered node with index = first_set(uncovered)
-        int any = first_set(uncovered);
-        if (any == -1) break;           // all covered
+        for(int u:order){ ch[u].clear(); for(int v:adj[u]) if(v!=par[u]) ch[u].push_back(v); }
 
-        // pick candidate among (any) and its neighbourhood that covers most
-        // We score every node in covered_by[any] (those that can cover `any`)
-        // Actually: any uncovered node MUST be covered by itself or a neighbour.
-        // The best branch is the one whose coverage_mask has largest overlap
-        // with uncovered.  We look at covered_by[any] set = {any}∪neighbours(any).
-
-        // Build list of candidates: any node c such that bit `any` is set in covered_by[c]
-        // = c == any  OR  any is neighbour of c  = covered_by[any] membership
-        // We just iterate covered_by[any] bitmask.
-        int best_cand = -1, best_score = -1;
-        vector<uint64_t> tmp_mask = covered_by[any]; // nodes that can cover `any`
-
-        // iterate set bits of tmp_mask
-        for (int w = 0; w < WORDS; w++) {
-            uint64_t word = tmp_mask[w];
-            while (word) {
-                int bit = __builtin_ctzll(word);
-                int cand = w * 64 + bit;
-                word &= word - 1;
-                // score = how many uncovered nodes cand would cover
-                int score = 0;
-                for (int ww = 0; ww < WORDS; ww++)
-                    score += __builtin_popcountll(covered_by[cand][ww] & uncovered[ww]);
-                if (score > best_score) { best_score = score; best_cand = cand; }
+        // bottom-up DP
+        for(int u:order){
+            dp[u]={1,INF,0};
+            for(int v:ch[u]){
+                array<int,3> nd;
+                int any =min({dp[v][0],dp[v][1],dp[v][2]});
+                int self=min( dp[v][0], dp[v][1]);
+                nd[0]=dp[u][0]+any;
+                nd[1]=min(dp[u][1]<INF?dp[u][1]+self:INF,
+                          dp[u][2]<INF?dp[u][2]+dp[v][0]:INF);
+                nd[2]=dp[u][2]<INF?dp[u][2]+self:INF;
+                dp[u]=nd;
             }
         }
 
-        // place plant at best_cand
-        out_state[best_cand] = 1;
-        count++;
-        // remove all nodes covered by best_cand from uncovered
-        for (int w = 0; w < WORDS; w++)
-            uncovered[w] &= ~covered_by[best_cand][w];
+        // top-down reconstruction
+        vector<int> nst(N,-1);
+        nst[root]=(dp[root][0]<=dp[root][1])?0:1;
+
+        reverse(order.begin(),order.end()); // root first
+        for(int u:order){
+            int su=nst[u];
+            if(su==0) result[u]=1;
+
+            if(su==0){
+                for(int v:ch[u]){
+                    int best=min({dp[v][0],dp[v][1],dp[v][2]});
+                    if     (dp[v][2]==best) nst[v]=2;
+                    else if(dp[v][1]==best) nst[v]=1;
+                    else                   nst[v]=0;
+                }
+            } else if(su==1){
+                // Find the ONE child that covers u (must be in state 0).
+                // That child is the one where switching it to state 0 achieves dp[u][1].
+                // Compute total_self = sum of min(dp[v][0],dp[v][1]) for all children.
+                int total_self=0; bool ov=false;
+                for(int v:ch[u]){int s=min(dp[v][0],dp[v][1]);if(s>=INF){ov=true;break;}total_self+=s;}
+                int covering=-1;
+                if(!ov){
+                    for(int v:ch[u]){
+                        int self_v=min(dp[v][0],dp[v][1]);
+                        int cost=total_self-self_v+dp[v][0];
+                        if(cost==dp[u][1]){covering=v;break;}
+                    }
+                }
+                if(covering==-1&&!ch[u].empty()) covering=ch[u][0]; // fallback
+                for(int v:ch[u]){
+                    if(v==covering) nst[v]=0;
+                    else nst[v]=(dp[v][1]<=dp[v][0])?1:0;
+                }
+            } else { // su==2
+                for(int v:ch[u]) nst[v]=(dp[v][1]<=dp[v][0])?1:0;
+            }
+        }
     }
-    return count;
+    return result;
 }
 
-// ─────────────────────────────────────────────
-//  Lower bound:
-//  Find a greedy independent set of uncovered nodes
-//  such that no two share a coverage candidate.
-//  Each such node needs at least one distinct plant → LB.
-// ─────────────────────────────────────────────
-static inline int lower_bound(const vector<uint64_t>& uncovered)
-{
-    // We scan uncovered nodes; for each, "remove" all nodes reachable by
-    // a single plant placement (i.e. covered_by[node] expanded one hop).
-    // This gives a greedy independent domination LB.
-    vector<uint64_t> remaining = uncovered;
-    int lb = 0;
-    while (true) {
-        int v = first_set(remaining);
-        if (v == -1) break;
-        lb++;
-        // remove all nodes that share a coverage candidate with v
-        // = union of covered_by[c] for all c in covered_by[v]
-        // That is: any node reachable within distance 2 from v
-        vector<uint64_t> tmp_candidates = covered_by[v]; // nodes that cover v
-        for (int w = 0; w < WORDS; w++) {
-            uint64_t word = tmp_candidates[w];
-            while (word) {
-                int bit = __builtin_ctzll(word);
-                int cand = w * 64 + bit;
-                word &= word - 1;
-                for (int ww = 0; ww < WORDS; ww++)
-                    remaining[ww] &= ~covered_by[cand][ww];
+// ═══════════════════════════════════════════════════════════════
+//  SOLVER 2 — BITMASK  (exact, n ≤ 25)
+// ═══════════════════════════════════════════════════════════════
+static vector<int> solve_bitmask(){
+    vector<uint32_t> cov(N);
+    for(int v=0;v<N;v++){cov[v]=1u<<v;for(int u:adj[v])cov[v]|=1u<<u;}
+    uint32_t all=(N==32)?0xFFFFFFFFu:((1u<<N)-1);
+    int bc=N+1; uint32_t bm=all;
+    for(uint32_t S=0;S<=all;S++){
+        int cnt=__builtin_popcount(S); if(cnt>=bc) continue;
+        uint32_t cov2=0;
+        for(uint32_t T=S;T;T&=T-1) cov2|=cov[__builtin_ctz(T)];
+        if(cov2==all){bc=cnt;bm=S;}
+    }
+    vector<int> r(N,0); for(int v=0;v<N;v++) if((bm>>v)&1) r[v]=1;
+    return r;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SOLVER 3 — OPTIMIZED BRANCH & BOUND
+// ═══════════════════════════════════════════════════════════════
+static atomic<int>  bnb_best;
+static mutex        bnb_mutex;
+static vector<int>  bnb_result;
+
+static int greedy_solution(vector<int>& out){
+    vector<uint64_t> unc(WORDS,~0ULL);
+    if(N%64) unc[WORDS-1]=(1ULL<<(N%64))-1;
+    out.assign(N,0); int cnt=0;
+    while(true){
+        int any=first_set(unc); if(any==-1) break;
+        int bc=-1,bs=-1;
+        for(int w=0;w<WORDS;w++){uint64_t word=covered_by[any][w];
+            while(word){int bit=__builtin_ctzll(word);word&=word-1;
+                int c=w*64+bit,s=0;
+                for(int ww=0;ww<WORDS;ww++) s+=__builtin_popcountll(covered_by[c][ww]&unc[ww]);
+                if(s>bs){bs=s;bc=c;}
+            }
+        }
+        out[bc]=1; cnt++;
+        for(int w=0;w<WORDS;w++) unc[w]&=~covered_by[bc][w];
+    }
+    return cnt;
+}
+
+static inline int lower_bound(const vector<uint64_t>& unc){
+    vector<uint64_t> rem=unc; int lb=0;
+    while(true){
+        int v=first_set(rem); if(v==-1) break; lb++;
+        for(int w=0;w<WORDS;w++){uint64_t word=covered_by[v][w];
+            while(word){int bit=__builtin_ctzll(word);word&=word-1;
+                int c=w*64+bit;
+                for(int ww=0;ww<WORDS;ww++) rem[ww]&=~covered_by[c][ww];
             }
         }
     }
     return lb;
 }
 
-// ─────────────────────────────────────────────
-//  Branch & Bound
-//  state_bits  : bitmask of nodes WITH a plant
-//  covered     : bitmask of nodes currently powered
-//  uncovered   : complement (for fast access)
-//  count       : plants placed so far
-//  placement   : the actual node→{0,1} assignment for reconstruction
-// ─────────────────────────────────────────────
-static void BNB(
-    vector<uint64_t>& state_bits,
-    vector<uint64_t>& uncovered,
-    int count,
-    vector<int>& placement)
-{
-    // ── Prune 1: count already not better ──
-    if (count >= best_count.load(memory_order_relaxed)) return;
+static void BNB(vector<uint64_t>& sb,vector<uint64_t>& unc,int cnt,vector<int>& pl){
+    if(cnt>=bnb_best.load(memory_order_relaxed)) return;
+    if(cnt+lower_bound(unc)>=bnb_best.load(memory_order_relaxed)) return;
 
-    // ── Prune 2: lower bound ──
-    if (count + lower_bound(uncovered) >= best_count.load(memory_order_relaxed)) return;
-
-    // ── Find most-constrained uncovered node ──
-    // = uncovered node with smallest |covered_by[v] ∩ (unplanted nodes)|
-    // (fewest ways to cover it → branch factor minimised)
-    int chosen = -1, chosen_score = INT_MAX;
-    {
-        vector<uint64_t> remaining = uncovered;
-        // iterate uncovered nodes
-        for (int w = 0; w < WORDS && chosen_score > 1; w++) {
-            uint64_t word = remaining[w];
-            while (word && chosen_score > 1) {
-                int bit = __builtin_ctzll(word);
-                int v = w * 64 + bit;
-                word &= word - 1;
-                // count candidate plants that could cover v
-                // = nodes in covered_by[v] that are NOT yet a plant
-                int score = 0;
-                for (int ww = 0; ww < WORDS; ww++)
-                    score += __builtin_popcountll(covered_by[v][ww] & ~state_bits[ww]);
-                if (score < chosen_score) { chosen_score = score; chosen = v; }
-            }
+    int chosen=-1,cscore=INT_MAX;
+    for(int w=0;w<WORDS&&cscore>1;w++){uint64_t word=unc[w];
+        while(word&&cscore>1){int bit=__builtin_ctzll(word);word&=word-1;
+            int v=w*64+bit,s=0;
+            for(int ww=0;ww<WORDS;ww++) s+=__builtin_popcountll(covered_by[v][ww]&~sb[ww]);
+            if(s<cscore){cscore=s;chosen=v;}
         }
     }
 
-    // ── All covered → update best ──
-    if (chosen == -1) {
-        int cur = best_count.load(memory_order_relaxed);
-        while (count < cur &&
-               !best_count.compare_exchange_weak(cur, count, memory_order_relaxed));
-        if (count <= best_count.load(memory_order_relaxed)) {
-            lock_guard<mutex> lk(best_mutex);
-            if (count < (int)best_state_global.size() ||
-                count <= best_count.load(memory_order_relaxed)) {
-                best_state_global = placement;
-                best_count.store(count, memory_order_relaxed);
-            }
+    if(chosen==-1){
+        int cur=bnb_best.load(memory_order_relaxed);
+        while(cnt<cur&&!bnb_best.compare_exchange_weak(cur,cnt,memory_order_relaxed));
+        if(cnt<=bnb_best.load(memory_order_relaxed)){
+            lock_guard<mutex> lk(bnb_mutex);
+            if(cnt<=bnb_best.load(memory_order_relaxed)){bnb_result=pl;bnb_best.store(cnt,memory_order_relaxed);}
         }
         return;
     }
 
-    // ── Branch: try each candidate plant for `chosen` ──
-    // Candidates = nodes in covered_by[chosen] not already planted
-    vector<uint64_t> candidates = covered_by[chosen];
-
-    // Sort candidates by descending coverage of remaining uncovered nodes
-    // (place the most-promising branch first for faster pruning)
-    vector<pair<int,int>> cand_list; // (score, node)
-    for (int w = 0; w < WORDS; w++) {
-        uint64_t word = candidates[w];
-        while (word) {
-            int bit = __builtin_ctzll(word);
-            int cand = w * 64 + bit;
-            word &= word - 1;
-            if (state_bits[cand / 64] & (1ULL << (cand % 64))) continue; // already planted
-            int score = 0;
-            for (int ww = 0; ww < WORDS; ww++)
-                score += __builtin_popcountll(covered_by[cand][ww] & uncovered[ww]);
-            cand_list.push_back({score, cand});
+    vector<pair<int,int>> cands;
+    for(int w=0;w<WORDS;w++){uint64_t word=covered_by[chosen][w];
+        while(word){int bit=__builtin_ctzll(word);word&=word-1;
+            int c=w*64+bit; if(bit_test(sb,c)) continue;
+            int s=0;
+            for(int ww=0;ww<WORDS;ww++) s+=__builtin_popcountll(covered_by[c][ww]&unc[ww]);
+            cands.push_back({s,c});
         }
     }
-    sort(cand_list.rbegin(), cand_list.rend()); // descending score
+    sort(cands.rbegin(),cands.rend());
 
-    for (auto& [score, cand] : cand_list) {
-        if (count + 1 >= best_count.load(memory_order_relaxed)) break; // prune early
-
-        // Place plant at cand
-        state_bits[cand / 64] |= (1ULL << (cand % 64));
-        placement[cand] = 1;
-
-        // Update uncovered
-        vector<uint64_t> new_uncovered(WORDS);
-        for (int w = 0; w < WORDS; w++)
-            new_uncovered[w] = uncovered[w] & ~covered_by[cand][w];
-
-        BNB(state_bits, new_uncovered, count + 1, placement);
-
-        // Undo
-        state_bits[cand / 64] &= ~(1ULL << (cand % 64));
-        placement[cand] = 0;
+    for(auto&[s,c]:cands){
+        if(cnt+1>=bnb_best.load(memory_order_relaxed)) break;
+        bit_set(sb,c); pl[c]=1;
+        vector<uint64_t> nu(WORDS);
+        for(int w=0;w<WORDS;w++) nu[w]=unc[w]&~covered_by[c][w];
+        BNB(sb,nu,cnt+1,pl);
+        bit_clear(sb,c); pl[c]=0;
     }
 }
 
-// ─────────────────────────────────────────────
-//  Thread worker: explores one top-level branch
-// ─────────────────────────────────────────────
-struct Task {
-    int plant_node;                 // the node forced to have a plant
-    vector<uint64_t> state_bits;
-    vector<uint64_t> uncovered;
-    vector<int>      placement;
-};
-
-static void thread_worker(Task task)
-{
-    // place the forced plant
-    int c = task.plant_node;
-    task.state_bits[c / 64] |= (1ULL << (c % 64));
-    task.placement[c] = 1;
-    for (int w = 0; w < WORDS; w++)
-        task.uncovered[w] &= ~covered_by[c][w];
-
-    BNB(task.state_bits, task.uncovered, 1, task.placement);
+struct Task{int pn;vector<uint64_t> sb,unc;vector<int> pl;};
+static void thread_worker(Task t){
+    int c=t.pn; bit_set(t.sb,c); t.pl[c]=1;
+    for(int w=0;w<WORDS;w++) t.unc[w]&=~covered_by[c][w];
+    BNB(t.sb,t.unc,1,t.pl);
 }
 
-// ─────────────────────────────────────────────
-//  main
-// ─────────────────────────────────────────────
-int main(int argc, char* argv[])
-{
-    ios::sync_with_stdio(false);
+static vector<int> solve_bnb(){
+    vector<int> gs; int gv=greedy_solution(gs);
+    bnb_best.store(gv,memory_order_relaxed); bnb_result=gs;
 
-    ifstream fin(argv[1]);
-    ofstream fout(argv[2]);
+    vector<uint64_t> init_unc(WORDS,~0ULL);
+    if(N%64) init_unc[WORDS-1]=(1ULL<<(N%64))-1;
 
-    int M;
-    fin >> N >> M;
-
-    WORDS = (N + 63) / 64;
-    covered_by.assign(N, vector<uint64_t>(WORDS, 0ULL));
-
-    // covered_by[v] = {v} ∪ neighbours(v)
-    for (int v = 0; v < N; v++)
-        covered_by[v][v / 64] |= (1ULL << (v % 64));
-
-    vector<vector<int>> adj(N);
-    for (int i = 0; i < M; i++) {
-        int u, v; fin >> u >> v;
-        adj[u].push_back(v);
-        adj[v].push_back(u);
-        covered_by[u][v / 64] |= (1ULL << (v % 64));
-        covered_by[v][u / 64] |= (1ULL << (u % 64));
-    }
-
-    // ── Greedy warm start ──
-    vector<int> greedy_state;
-    int greedy_val = greedy_solution(greedy_state);
-    best_count.store(greedy_val, memory_order_relaxed);
-    best_state_global = greedy_state;
-
-    // ── Build initial uncovered (all nodes) ──
-    vector<uint64_t> init_uncovered(WORDS, ~0ULL);
-    if (N % 64) init_uncovered[WORDS-1] = (1ULL << (N % 64)) - 1;
-
-    // ── Enumerate top-level candidates for the first uncovered node ──
-    // = covered_by[first uncovered node]
-    // Dispatch each as a separate thread task.
-    int root = first_set(init_uncovered); // node 0 in a full graph
-
+    int root=first_set(init_unc);
     vector<Task> tasks;
-    {
-        vector<uint64_t> cands = covered_by[root];
-        for (int w = 0; w < WORDS; w++) {
-            uint64_t word = cands[w];
-            while (word) {
-                int bit = __builtin_ctzll(word);
-                int cand = w * 64 + bit;
-                word &= word - 1;
-                Task t;
-                t.plant_node  = cand;
-                t.state_bits  = vector<uint64_t>(WORDS, 0ULL);
-                t.uncovered   = init_uncovered;
-                t.placement   = vector<int>(N, 0);
-                tasks.push_back(move(t));
-            }
+    for(int w=0;w<WORDS;w++){uint64_t word=covered_by[root][w];
+        while(word){int bit=__builtin_ctzll(word);word&=word-1;
+            Task t; t.pn=w*64+bit;
+            t.sb=vector<uint64_t>(WORDS,0ULL);
+            t.unc=init_unc; t.pl=vector<int>(N,0);
+            tasks.push_back(move(t));
         }
     }
-
-    // Sort tasks: highest-coverage candidate first
-    sort(tasks.begin(), tasks.end(), [](const Task& a, const Task& b){
-        int sa = 0, sb = 0;
-        for (int w = 0; w < WORDS; w++) {
-            sa += __builtin_popcountll(covered_by[a.plant_node][w]);
-            sb += __builtin_popcountll(covered_by[b.plant_node][w]);
-        }
-        return sa > sb;
+    sort(tasks.begin(),tasks.end(),[](const Task&a,const Task&b){
+        int sa=0,sb=0;
+        for(int w=0;w<WORDS;w++){sa+=__builtin_popcountll(covered_by[a.pn][w]);sb+=__builtin_popcountll(covered_by[b.pn][w]);}
+        return sa>sb;
     });
 
-    // ── Thread pool: use up to 12 threads ──
-    const int MAX_THREADS = min((int)tasks.size(), 12);
-    vector<thread> threads;
-    atomic<int> next_task(0);
+    const int MAX_T=min((int)tasks.size(),12);
+    atomic<int> nxt(0); vector<thread> threads;
+    auto worker=[&](){while(true){int i=nxt.fetch_add(1,memory_order_relaxed);if(i>=(int)tasks.size())break;thread_worker(move(tasks[i]));}};
+    for(int t=0;t<MAX_T;t++) threads.emplace_back(worker);
+    for(auto&t:threads) t.join();
+    return bnb_result;
+}
 
-    auto worker = [&]() {
-        while (true) {
-            int idx = next_task.fetch_add(1, memory_order_relaxed);
-            if (idx >= (int)tasks.size()) break;
-            thread_worker(move(tasks[idx]));
-        }
-    };
-
-    for (int t = 0; t < MAX_THREADS; t++)
-        threads.emplace_back(worker);
-    for (auto& t : threads)
-        t.join();
-
-    // ── Output ──
-    cout << "Minimum powerplant is: " << best_count.load() << "\n";
-    for (int i = 0; i < N; i++) {
-        cout << best_state_global[i];
-        fout << best_state_global[i];
+// ═══════════════════════════════════════════════════════════════
+//  MAIN
+// ═══════════════════════════════════════════════════════════════
+int main(int argc,char* argv[]){
+    ios::sync_with_stdio(false);
+    ifstream fin(argv[1]); ofstream fout(argv[2]);
+    fin>>N>>M;
+    adj.assign(N,{}); WORDS=(N+63)/64;
+    covered_by.assign(N,vector<uint64_t>(WORDS,0ULL));
+    for(int v=0;v<N;v++) bit_set(covered_by[v],v);
+    for(int i=0;i<M;i++){
+        int u,v; fin>>u>>v;
+        adj[u].push_back(v); adj[v].push_back(u);
+        bit_set(covered_by[u],v); bit_set(covered_by[v],u);
     }
 
+    vector<int> result; string method;
+
+    if(is_forest()){
+        method="Tree DP O(n)"; result=solve_tree();
+    } else if(N<=25){
+        method="Bitmask DP O(2^n)"; result=solve_bitmask();
+    } else {
+        method="Branch & Bound (multithreaded)"; result=solve_bnb();
+    }
+
+    // Safety: fix any uncovered node left by solver bugs
+    vector<bool> powered(N,false);
+    for(int v=0;v<N;v++) if(result[v]){powered[v]=true;for(int u:adj[v])powered[u]=true;}
+    for(int v=0;v<N;v++) if(!powered[v]){result[v]=1;for(int u:adj[v])powered[u]=true;}
+
+    int cnt=0; for(int v=0;v<N;v++) cnt+=result[v];
+
+    cout<<"Minimum powerplant is: "<<cnt<<" ["<<method<<"]\n";
+    fout<<"Minimum powerplant is: "<<cnt<<"\n";
+    for(int v=0;v<N;v++){cout<<result[v];fout<<result[v];}
+    cout<<"\n"; fout<<"\n";
     return 0;
 }
