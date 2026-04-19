@@ -47,11 +47,11 @@ void BNB(int count, vector<int>& state, vector<vector<int>>& adj){
 
 int main(int argc, char* argv[]){
 	ifstream fin(argv[1]); 
-    	ofstream fout(argv[2]);  
+    ofstream fout(argv[2]);  
 	
 	int m;
 	fin >> n >> m;
-	best = n;
+	best = n + 1;
 
 	vector<int>         state(n, -1);
 	vector<vector<int>> adj(n);
@@ -64,7 +64,7 @@ int main(int argc, char* argv[]){
 
 	BNB(0, state, adj);
 
-	cout << "Minimum popwerplant is: " << best << endl;
+	cout << "Minimum powerplant is: " << best << endl;
 	for(int i: best_state){
 		cout << (i==1 ? 1:0);
 		fout << (i==1 ? 1:0);
