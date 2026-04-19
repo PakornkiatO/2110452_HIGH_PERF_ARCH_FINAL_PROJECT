@@ -45,16 +45,19 @@ void BNB(int count, vector<int>& state, vector<vector<int>>& adj){
 	}
 }
 
-int main(){
+int main(int argc, char* argv[]){
+	ifstream fin(argv[1]); 
+    	ofstream fout(argv[2]);  
+	
 	int m;
-	cin >> n >> m;
+	fin >> n >> m;
 	best = n;
 
 	vector<int>         state(n, -1);
 	vector<vector<int>> adj(n);
 
 	for(int i = 0;i < m;i++){
-		int u, v; cin >> u >> v;
+		int u, v; fin >> u >> v;
 		adj[u].push_back(v);
 		adj[v].push_back(u);
 	}
@@ -62,7 +65,10 @@ int main(){
 	BNB(0, state, adj);
 
 	cout << "Minimum popwerplant is: " << best << endl;
-	for(int i: best_state) cout << i << " ";
+	for(int i: best_state){
+		cout << (i==1 ? 1:0);
+		fout << (i==1 ? 1:0);
+	}
 
 //	for(int i = 0;i < n;i++){
 //		cout << "Node " << i << " neighbors: ";
